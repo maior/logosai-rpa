@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logos-rpa"
+version = "0.1.0"
+description = "Desktop RPA for AI agents — browser automation, screen recognition, keyboard/mouse control"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+keywords = ["rpa", "automation", "desktop", "browser", "ai-agent", "screen-recognition"]
+authors = [
+    {name = "LogosAI Team", email = "info@logosai.info"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Development Status :: 3 - Alpha",
+]
+
+dependencies = [
+    "pyautogui>=0.9.53",
+    "pillow>=9.0.0",
+    "loguru>=0.7.0",
+]
+
+[project.optional-dependencies]
+vision = [
+    "google-genai>=1.0.0",
+]
+playwright = [
+    "playwright>=1.40.0",
+]
+all = [
+    "logos-rpa[vision]",
+    "logos-rpa[playwright]",
+]
+
+[project.urls]
+Homepage = "https://github.com/maior/logosai-rpa"
+Repository = "https://github.com/maior/logosai-rpa"
+Issues = "https://github.com/maior/logosai-rpa/issues"
+
+[tool.setuptools.packages.find]
+include = ["logosrpa*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311", "py312"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
