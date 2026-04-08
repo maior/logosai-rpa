@@ -30,55 +30,115 @@ class RPA:
         self.mouse = mouse
         self.keyboard = keyboard
 
-    # ─── High-Level Actions ──────────────────────────────
+    # ─── Recovery Engine ────────────────────────────────
+
+    async def _execute_recovery(self, recovery_steps: list) -> bool:
+        """Execute recovery steps from diagnose()."""
+        for step in recovery_steps:
+            action = step.get("action", "")
+            desc = step.get("description", "")
+            try:
+                if action == "click":
+                    x, y = step.get("x", 0), step.get("y", 0)
+                    if x and y:
+                        await mouse.click(x, y)
+                        logger.info(f"  🔧 Recovery click ({x},{y}): {desc}")
+                elif action == "type":
+                    text = step.get("text", "")
+                    if text:
+                        await keyboard.type_text(text)
+                        logger.info(f"  🔧 Recovery type: {desc}")
+                elif action == "hotkey":
+                    keys = step.get("keys", [])
+                    if keys:
+                        await keyboard.hotkey(*keys)
+                        logger.info(f"  🔧 Recovery hotkey {'+'.join(keys)}: {desc}")
+                elif action == "press":
+                    key = step.get("key", "")
+                    if key:
+                        await keyboard.press(key)
+                        logger.info(f"  🔧 Recovery press {key}: {desc}")
+                elif action == "wait":
+                    secs = step.get("seconds", 1)
+                    await asyncio.sleep(secs)
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.warning(f"  🔧 Recovery step failed: {e}")
+        return True
+
+    # ─── High-Level Actions (with auto-diagnose) ─────
 
     async def find_and_click(self, text: str, element_type: str = "any",
-                             engine: str = "auto", timeout: float = 5) -> bool:
+                             engine: str = "auto", timeout: float = 5,
+                             max_retries: int = 2) -> bool:
         """Find element by text and click its center.
 
-        Tries to find element within timeout, then clicks.
-        Returns True if successful.
+        On failure: auto-diagnose with Vision → recover → retry.
         """
         import time
-        start = time.time()
-        while time.time() - start < timeout:
-            el = await self.screen.find_one(text, element_type=element_type, engine=engine)
-            if el:
-                cx, cy = el.center
-                await mouse.click(cx, cy)
-                logger.info(f"✅ Clicked '{text}' at ({cx}, {cy}) [{el.source}]")
-                return True
-            await asyncio.sleep(0.5)
 
-        logger.warning(f"❌ find_and_click: '{text}' not found in {timeout}s")
+        for attempt in range(1 + max_retries):
+            start = time.time()
+            while time.time() - start < timeout:
+                el = await self.screen.find_one(text, element_type=element_type, engine=engine)
+                if el:
+                    cx, cy = el.center
+                    await mouse.click(cx, cy)
+                    logger.info(f"✅ Clicked '{text}' at ({cx}, {cy}) [{el.source}]")
+                    return True
+                await asyncio.sleep(0.5)
+
+            # 실패 → 진단 (마지막 시도가 아닐 때만)
+            if attempt < max_retries:
+                logger.warning(f"⚠️ find_and_click('{text}') failed, diagnosing... (attempt {attempt+1})")
+                diagnosis = await self.screen.diagnose(f"'{text}' 요소를 찾아 클릭하려 함")
+                cause = diagnosis.get("cause", "unknown")
+                recovery = diagnosis.get("recovery", [])
+                logger.info(f"  📋 Cause: {cause}")
+
+                if recovery:
+                    await self._execute_recovery(recovery)
+                    await asyncio.sleep(0.5)
+                    continue
+            break
+
+        logger.warning(f"❌ find_and_click: '{text}' not found after {max_retries+1} attempts")
         return False
 
     async def find_and_type(self, field_text: str, input_text: str,
-                            engine: str = "auto", clear: bool = True) -> bool:
+                            engine: str = "auto", clear: bool = True,
+                            max_retries: int = 2) -> bool:
         """Find input field by text, click it, then type.
 
-        Args:
-            field_text: Text to identify the input field (label, placeholder)
-            input_text: Text to type into the field
-            clear: Clear existing content before typing
+        On failure: auto-diagnose → recover → retry.
         """
-        el = await self.screen.find_one(field_text, element_type="input", engine=engine)
-        if not el:
-            # Try finding by nearby text (label next to input)
-            el = await self.screen.find_one(field_text, element_type="any", engine=engine)
+        for attempt in range(1 + max_retries):
+            el = await self.screen.find_one(field_text, element_type="input", engine=engine)
+            if not el:
+                el = await self.screen.find_one(field_text, element_type="any", engine=engine)
 
-        if el:
-            cx, cy = el.center
-            await mouse.click(cx, cy)
-            await asyncio.sleep(0.2)
-            if clear:
-                await keyboard.clear_field()
-                await asyncio.sleep(0.1)
-            await keyboard.type_text(input_text)
-            logger.info(f"✅ Typed '{input_text}' into '{field_text}' [{el.source}]")
-            return True
+            if el:
+                cx, cy = el.center
+                await mouse.click(cx, cy)
+                await asyncio.sleep(0.2)
+                if clear:
+                    await keyboard.clear_field()
+                    await asyncio.sleep(0.1)
+                await keyboard.type_text(input_text)
+                logger.info(f"✅ Typed '{input_text}' into '{field_text}' [{el.source}]")
+                return True
 
-        logger.warning(f"❌ find_and_type: field '{field_text}' not found")
+            # 실패 → 진단
+            if attempt < max_retries:
+                logger.warning(f"⚠️ find_and_type('{field_text}') failed, diagnosing...")
+                diagnosis = await self.screen.diagnose(f"'{field_text}' 입력란을 찾아 '{input_text}' 입력하려 함")
+                recovery = diagnosis.get("recovery", [])
+                if recovery:
+                    await self._execute_recovery(recovery)
+                    continue
+            break
+
+        logger.warning(f"❌ find_and_type: '{field_text}' not found")
         return False
 
     async def wait_and_click(self, text: str, timeout: float = 10, engine: str = "auto") -> bool:
@@ -89,7 +149,76 @@ class RPA:
             await mouse.click(cx, cy)
             logger.info(f"✅ Waited and clicked '{text}' at ({cx}, {cy})")
             return True
+
+        # 타임아웃 → 진단
+        logger.warning(f"⚠️ wait_and_click('{text}') timeout, diagnosing...")
+        diagnosis = await self.screen.diagnose(f"'{text}'가 화면에 나타나기를 기다렸으나 {timeout}초 초과")
+        recovery = diagnosis.get("recovery", [])
+        if recovery:
+            await self._execute_recovery(recovery)
+            # 한번 더 시도
+            el = await self.screen.find_one(text, engine=engine)
+            if el:
+                await mouse.click(*el.center)
+                return True
+
         return False
+
+    # ─── App Control ─────────────────────────────────────
+
+    async def open_app(self, app_name: str):
+        """Open/activate a macOS application — like clicking the Dock icon.
+
+        Priority:
+        1. Dock icon click (most human-like, brings window to front)
+        2. AppleScript activate (fallback)
+        3. `open -a` (last resort)
+        """
+        from .platform.macos import applescript_async
+        import subprocess
+
+        # Method 1: Dock 아이콘 클릭 (사람처럼)
+        try:
+            result = await applescript_async(f'''
+tell application "System Events"
+    tell process "Dock"
+        click UI element "{app_name}" of list 1
+    end tell
+end tell''')
+            if result and "UI element" in result:
+                await asyncio.sleep(1.5)
+                logger.info(f"✅ App opened via Dock click: {app_name}")
+                return True
+        except Exception:
+            pass
+
+        # Method 2: AppleScript activate
+        await applescript_async(f'tell application "{app_name}" to activate')
+        await asyncio.sleep(1)
+
+        front = await self.get_frontmost_app()
+        if app_name.lower() in front.lower():
+            logger.info(f"✅ App activated: {app_name}")
+            return True
+
+        # Method 3: open -a
+        try:
+            subprocess.Popen(["open", "-a", app_name])
+            await asyncio.sleep(2)
+            logger.info(f"✅ App opened: {app_name}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to open {app_name}: {e}")
+            return False
+
+    async def get_frontmost_app(self) -> str:
+        """Get the name of the frontmost application."""
+        from .platform.macos import applescript_async
+        return await applescript_async("""
+            tell application "System Events"
+                return name of first application process whose frontmost is true
+            end tell
+        """)
 
     async def click_at(self, x: int, y: int):
         """Click at specific coordinates."""

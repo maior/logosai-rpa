@@ -346,6 +346,77 @@ JSON only, no explanation."""
         logger.warning(f"wait_for_text timeout: '{text}' not found in {timeout}s")
         return None
 
+    async def diagnose(self, intention: str, img_path: Optional[str] = None) -> Dict[str, Any]:
+        """Diagnose why an action failed by analyzing the current screen.
+
+        Called automatically when find/click/type fails.
+
+        Args:
+            intention: What the RPA was trying to do (e.g., "검색창에 '권형근' 입력")
+            img_path: Screenshot path (auto-capture if None)
+
+        Returns:
+            {"status": "현재 화면 상태",
+             "cause": "실패 원인",
+             "recovery": [{"action": "click|type|hotkey|press|wait", "params": {...}}]}
+        """
+        if not self._gemini_key:
+            return {"status": "unknown", "cause": "Gemini API key missing", "recovery": []}
+
+        if not img_path:
+            from .platform.macos import screenshot_async
+            img_path = await screenshot_async()
+            if not img_path:
+                return {"status": "unknown", "cause": "Screenshot failed", "recovery": []}
+
+        try:
+            from google import genai
+            from google.genai import types
+            import PIL.Image
+
+            client = genai.Client(api_key=self._gemini_key)
+            image = PIL.Image.open(img_path)
+            img_w, img_h = image.size
+
+            prompt = f"""RPA 자동화 중 문제가 발생했습니다.
+
+의도한 작업: "{intention}"
+
+이 스크린샷을 분석하여 다음을 JSON으로 반환하세요:
+{{
+  "status": "현재 화면에 보이는 상태 (어떤 앱, 어떤 화면, 무엇이 보이는지)",
+  "cause": "의도한 작업이 실패한 원인 (포커스 문제, 팝업, 잘못된 화면 등)",
+  "recovery": [
+    {{"action": "click", "x": 픽셀X, "y": 픽셀Y, "description": "어디를 클릭"}},
+    {{"action": "type", "text": "입력할 텍스트", "description": "무엇을 입력"}},
+    {{"action": "hotkey", "keys": ["command", "f"], "description": "단축키"}},
+    {{"action": "press", "key": "enter", "description": "키 입력"}},
+    {{"action": "wait", "seconds": 1, "description": "대기"}}
+  ]
+}}
+
+이미지 크기: {img_w}x{img_h}. 클릭 좌표는 화면 픽셀 기준.
+recovery는 문제 해결을 위한 단계별 액션 목록 (1-5개).
+JSON만 반환, 설명 없이."""
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[prompt, image],
+                config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=1000),
+            )
+
+            import re
+            match = re.search(r'\{.*\}', response.text, re.DOTALL)
+            if match:
+                result = json.loads(match.group())
+                logger.info(f"🔍 Diagnose: status={result.get('status','')[:50]}, cause={result.get('cause','')[:50]}")
+                return result
+
+        except Exception as e:
+            logger.error(f"Diagnose failed: {e}")
+
+        return {"status": "unknown", "cause": str(e) if 'e' in dir() else "unknown", "recovery": []}
+
     async def read_all_text(self, engine: str = "apple_vision") -> str:
         """Read all visible text on screen."""
         elements = await self.find("", engine=engine)
