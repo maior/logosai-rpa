@@ -70,25 +70,35 @@ class RPA:
 
     async def find_and_click(self, text: str, element_type: str = "any",
                              engine: str = "auto", timeout: float = 5,
-                             max_retries: int = 2) -> bool:
+                             max_retries: int = 2, app: str = "") -> bool:
         """Find element by text and click its center.
 
+        Args:
+            app: If set, search within this app's window only (crop + coordinate transform)
         On failure: auto-diagnose with Vision → recover → retry.
         """
         import time
 
         for attempt in range(1 + max_retries):
-            start = time.time()
-            while time.time() - start < timeout:
-                el = await self.screen.find_one(text, element_type=element_type, engine=engine)
+            # 앱 윈도우 기반 검색
+            if app:
+                el = await self._find_in_app_window(text, app)
                 if el:
-                    cx, cy = el.center
-                    await mouse.click(cx, cy)
-                    logger.info(f"✅ Clicked '{text}' at ({cx}, {cy}) [{el.source}]")
+                    await mouse.click(*el.center)
+                    logger.info(f"✅ Clicked '{text}' at {el.center} [app:{app}]")
                     return True
-                await asyncio.sleep(0.5)
+            else:
+                start = time.time()
+                while time.time() - start < timeout:
+                    el = await self.screen.find_one(text, element_type=element_type, engine=engine)
+                    if el:
+                        cx, cy = el.center
+                        await mouse.click(cx, cy)
+                        logger.info(f"✅ Clicked '{text}' at ({cx}, {cy}) [{el.source}]")
+                        return True
+                    await asyncio.sleep(0.5)
 
-            # 실패 → 진단 (마지막 시도가 아닐 때만)
+            # 실패 → 진단
             if attempt < max_retries:
                 logger.warning(f"⚠️ find_and_click('{text}') failed, diagnosing... (attempt {attempt+1})")
                 diagnosis = await self.screen.diagnose(f"'{text}' 요소를 찾아 클릭하려 함")
@@ -104,6 +114,56 @@ class RPA:
 
         logger.warning(f"❌ find_and_click: '{text}' not found after {max_retries+1} attempts")
         return False
+
+    async def _find_in_app_window(self, text: str, app_name: str) -> Optional[ScreenElement]:
+        """Find element within a specific app's window using Gemini Vision.
+
+        Crops the app window, sends to Gemini, converts coordinates back to screen.
+        """
+        from .platform.macos import screenshot_app_window, retina_scale
+        import json, re, os
+
+        crop_path, bounds = screenshot_app_window(app_name)
+        if not crop_path or not bounds:
+            return None
+
+        try:
+            from google import genai
+            from google.genai import types
+            import PIL.Image
+
+            client = genai.Client(api_key=self.screen._gemini_key or os.getenv("GOOGLE_API_KEY", ""))
+            image = PIL.Image.open(crop_path)
+            iw, ih = image.size
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[
+                    f'이 {app_name} 앱 스크린샷에서 "{text}" 항목의 위치를 찾아줘.\n'
+                    f'이미지 크기: {iw}x{ih} 픽셀.\n'
+                    f'해당 항목의 중앙 좌표를 반환: {{"x": 픽셀X, "y": 픽셀Y}}\n'
+                    'JSON만, 설명 없이.',
+                    image,
+                ],
+                config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=200),
+            )
+
+            match = re.search(r'\{.*\}', response.text, re.DOTALL)
+            if match:
+                coords = json.loads(match.group())
+                scale = retina_scale()
+                # 크롭 이미지 좌표 → 스크린 논리 좌표
+                screen_x = bounds["x"] + int(coords["x"] / scale)
+                screen_y = bounds["y"] + int(coords["y"] / scale)
+                logger.debug(f"  App window: crop({coords['x']},{coords['y']}) / scale={scale} + offset({bounds['x']},{bounds['y']}) → screen({screen_x},{screen_y})")
+                return ScreenElement(
+                    text=text, x=screen_x - 10, y=screen_y - 10,
+                    width=20, height=20,
+                    element_type="text", confidence=0.8, source=f"gemini_app:{app_name}",
+                )
+        except Exception as e:
+            logger.error(f"_find_in_app_window failed: {e}")
+        return None
 
     async def find_and_type(self, field_text: str, input_text: str,
                             engine: str = "auto", clear: bool = True,
@@ -166,50 +226,29 @@ class RPA:
 
     # ─── App Control ─────────────────────────────────────
 
-    async def open_app(self, app_name: str):
-        """Open/activate a macOS application — like clicking the Dock icon.
+    async def open_app(self, app_name: str) -> bool:
+        """Open/activate app and VERIFY it's frontmost.
 
-        Priority:
-        1. Dock icon click (most human-like, brings window to front)
-        2. AppleScript activate (fallback)
-        3. `open -a` (last resort)
+        Dock click + frontmost check. Retries if not in front.
         """
-        from .platform.macos import applescript_async
-        import subprocess
+        from .platform.macos import ensure_app_frontmost
 
-        # Method 1: Dock 아이콘 클릭 (사람처럼)
-        try:
-            result = await applescript_async(f'''
-tell application "System Events"
-    tell process "Dock"
-        click UI element "{app_name}" of list 1
-    end tell
-end tell''')
-            if result and "UI element" in result:
-                await asyncio.sleep(1.5)
-                logger.info(f"✅ App opened via Dock click: {app_name}")
-                return True
-        except Exception:
-            pass
-
-        # Method 2: AppleScript activate
-        await applescript_async(f'tell application "{app_name}" to activate')
-        await asyncio.sleep(1)
-
-        front = await self.get_frontmost_app()
-        if app_name.lower() in front.lower():
-            logger.info(f"✅ App activated: {app_name}")
+        success = await asyncio.to_thread(ensure_app_frontmost, app_name)
+        if success:
+            logger.info(f"✅ App frontmost: {app_name}")
+            # 윈도우 클릭으로 키보드 포커스 확보
+            from .platform.macos import get_app_window_bounds
+            bounds = get_app_window_bounds(app_name)
+            if bounds:
+                cx = bounds["x"] + bounds["width"] // 2
+                cy = bounds["y"] + 30  # 타이틀바 아래
+                await mouse.click(cx, cy)
+                await asyncio.sleep(0.3)
+                logger.debug(f"  Window focus click: ({cx}, {cy})")
             return True
 
-        # Method 3: open -a
-        try:
-            subprocess.Popen(["open", "-a", app_name])
-            await asyncio.sleep(2)
-            logger.info(f"✅ App opened: {app_name}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to open {app_name}: {e}")
-            return False
+        logger.error(f"❌ Failed to bring {app_name} to front")
+        return False
 
     async def get_frontmost_app(self) -> str:
         """Get the name of the frontmost application."""

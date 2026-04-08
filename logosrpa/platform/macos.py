@@ -80,17 +80,114 @@ async def screenshot_async(region: Optional[Tuple[int, int, int, int]] = None) -
 
 
 def get_screen_size() -> Tuple[int, int]:
-    """Get screen resolution."""
-    result = applescript('''
-tell application "Finder"
-    set screenBounds to bounds of window of desktop
-    return (item 3 of screenBounds) & "," & (item 4 of screenBounds)
-end tell''')
+    """Get logical screen resolution (pyautogui coordinates)."""
     try:
-        parts = result.split(",")
-        return int(parts[0].strip()), int(parts[1].strip())
+        import pyautogui
+        return pyautogui.size()
     except Exception:
         return 1920, 1080
+
+
+def get_retina_scale() -> float:
+    """Get Retina scale factor (screenshot pixels / logical pixels)."""
+    try:
+        import pyautogui
+        logical_w = pyautogui.size()[0]
+        # Quick screencapture to check actual pixel size
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "logosrpa_scale.png")
+        subprocess.run(["screencapture", "-x", path], timeout=5, capture_output=True)
+        from PIL import Image
+        pixel_w = Image.open(path).size[0]
+        return pixel_w / logical_w
+    except Exception:
+        return 2.0  # Default Retina
+
+
+_RETINA_SCALE: Optional[float] = None
+
+
+def retina_scale() -> float:
+    """Cached Retina scale factor."""
+    global _RETINA_SCALE
+    if _RETINA_SCALE is None:
+        _RETINA_SCALE = get_retina_scale()
+    return _RETINA_SCALE
+
+
+def get_app_window_bounds(app_name: str) -> Optional[Dict[str, int]]:
+    """Get any app's window position and size (logical coordinates)."""
+    result = applescript(f'''tell application "System Events"
+    tell process "{app_name}"
+        if (count of windows) = 0 then return ""
+        set w to first window
+        set p to position of w
+        set s to size of w
+        return (item 1 of p as string) & "|" & (item 2 of p as string) & "|" & (item 1 of s as string) & "|" & (item 2 of s as string)
+    end tell
+end tell''')
+    try:
+        if not result or "|" not in result:
+            return None
+        parts = [int(x) for x in result.split("|")]
+        return {"x": parts[0], "y": parts[1], "width": parts[2], "height": parts[3]}
+    except Exception:
+        return None
+
+
+def screenshot_app_window(app_name: str) -> Tuple[Optional[str], Optional[Dict[str, int]]]:
+    """Capture screenshot of a specific app window only.
+
+    Returns: (cropped_image_path, logical_bounds) or (None, None)
+    """
+    bounds = get_app_window_bounds(app_name)
+    if not bounds:
+        return None, None
+
+    full_path = screenshot()
+    if not full_path:
+        return None, None
+
+    try:
+        from PIL import Image
+        full = Image.open(full_path)
+        scale = retina_scale()
+
+        # Crop with Retina scaling
+        x, y, w, h = bounds["x"], bounds["y"], bounds["width"], bounds["height"]
+        crop_box = (int(x * scale), int(y * scale), int((x + w) * scale), int((y + h) * scale))
+        cropped = full.crop(crop_box)
+
+        crop_path = os.path.join(tempfile.gettempdir(), f"logosrpa_{app_name.lower()}.png")
+        cropped.save(crop_path)
+        return crop_path, bounds
+    except Exception as e:
+        logger.error(f"App window screenshot failed: {e}")
+        return None, None
+
+
+def ensure_app_frontmost(app_name: str, max_retries: int = 3) -> bool:
+    """Ensure app is truly frontmost — Dock click + verify."""
+    for attempt in range(max_retries):
+        # Dock click
+        applescript(f'''tell application "System Events"
+    tell process "Dock"
+        click UI element "{app_name}" of list 1
+    end tell
+end tell''')
+        import time
+        time.sleep(1)
+
+        # Verify
+        front = applescript('''tell application "System Events"
+    return name of first application process whose frontmost is true
+end tell''')
+
+        if app_name.lower() in front.lower():
+            return True
+        logger.warning(f"App not frontmost (attempt {attempt+1}): expected={app_name}, got={front}")
+
+    return False
 
 
 def get_chrome_window_bounds() -> Optional[Dict[str, int]]:
